@@ -11,6 +11,7 @@
 #include "processor/operator/base_partitioner_shared_state.h"
 #include "storage/buffer_manager/memory_manager.h"
 #include "storage/local_cached_column.h"
+#include "storage/table/table.h"
 #include "transaction/transaction.h"
 
 namespace lbug {
@@ -227,10 +228,19 @@ public:
     transaction::Transaction* getTransaction() const { return transaction; }
     storage::NodeTableScanState& getScanState() { return *scanState; }
     common::DataChunk& getScanChunk() { return scanChunk; }
+    // A scan state for single-row lookups in one node group (and source),
+    // initialized on first use and kept: HNSW lookups hop between node
+    // groups, and re-initializing one shared state on every hop dominates
+    // search cost once a table spans several node groups.
+    storage::NodeTableScanState& getLookupState(storage::TableScanSource source,
+        common::node_group_idx_t nodeGroupIdx);
 
 private:
     transaction::Transaction* transaction;
+    storage::NodeTable* nodeTable;
+    common::column_id_t columnID;
     std::unique_ptr<storage::NodeTableScanState> scanState;
+    std::unordered_map<uint64_t, std::unique_ptr<storage::NodeTableScanState>> lookupStates;
     common::DataChunk scanChunk;
 
     // Used for managing used space in the output list data vector

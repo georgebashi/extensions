@@ -703,29 +703,20 @@ std::unique_ptr<GetEmbeddingsScanState> OnDiskEmbeddings::constructScanState(
 EmbeddingHandle OnDiskEmbeddings::getEmbedding(common::offset_t offset,
     GetEmbeddingsScanState& embeddingScanState) const {
     auto& onDiskScanState = embeddingScanState.cast<OnDiskEmbeddingScanState>();
-    auto& scanState = onDiskScanState.getScanState();
     auto* scanTransaction = onDiskScanState.getTransaction();
     if (!nodeTable.isVisibleNoLock(scanTransaction, offset)) {
         return EmbeddingHandle::createNullHandle();
     }
+    auto source = TableScanSource::COMMITTED;
+    auto nodeGroupIdx = StorageUtils::getNodeGroupIdx(offset);
+    if (scanTransaction->isUnCommitted(nodeTable, offset)) {
+        source = TableScanSource::UNCOMMITTED;
+        nodeGroupIdx =
+            StorageUtils::getNodeGroupIdx(scanTransaction->getLocalRowIdx(nodeTable, offset));
+    }
+    auto& scanState = onDiskScanState.getLookupState(source, nodeGroupIdx);
     scanState.nodeIDVector->setValue(0, common::internalID_t{offset, nodeTable.getTableID()});
     scanState.nodeIDVector->state->getSelVectorUnsafe().setToUnfiltered(1);
-    const auto source = scanState.source;
-    const auto nodeGroupIdx = scanState.nodeGroupIdx;
-    if (scanTransaction->isUnCommitted(nodeTable, offset)) {
-        scanState.source = TableScanSource::UNCOMMITTED;
-        scanState.nodeGroupIdx =
-            StorageUtils::getNodeGroupIdx(scanTransaction->getLocalRowIdx(nodeTable, offset));
-    } else {
-        scanState.source = TableScanSource::COMMITTED;
-        scanState.nodeGroupIdx = StorageUtils::getNodeGroupIdx(offset);
-    }
-    if (source == scanState.source && nodeGroupIdx == scanState.nodeGroupIdx) {
-        // If the scan state is already initialized for the same source and node group, we can skip
-        // re-initialization.
-    } else {
-        nodeTable.initScanState(scanTransaction, scanState);
-    }
     const auto result = nodeTable.lookup<false>(scanTransaction, scanState);
     DASSERT(scanState.outputVectors.size() == 1 &&
             scanState.outputVectors[0]->state->getSelVector()[0] == 0);
@@ -789,7 +780,8 @@ std::vector<EmbeddingHandle> OnDiskEmbeddings::getEmbeddings(
 OnDiskEmbeddingScanState::OnDiskEmbeddingScanState(transaction::Transaction* transaction,
     MemoryManager* mm, NodeTable& nodeTable, common::column_id_t columnID,
     common::offset_t embeddingDim)
-    : transaction(transaction), embeddingDim(embeddingDim) {
+    : transaction(transaction), nodeTable(&nodeTable), columnID(columnID),
+      embeddingDim(embeddingDim) {
     std::vector columnIDs{columnID};
     // The first ValueVector in scanChunk is reserved for nodeIDs.
     std::vector<common::LogicalType> types;
@@ -800,6 +792,22 @@ OnDiskEmbeddingScanState::OnDiskEmbeddingScanState(transaction::Transaction* tra
     scanState = std::make_unique<NodeTableScanState>(&scanChunk.getValueVectorMutable(0),
         outVectors, scanChunk.state);
     scanState->setToTable(transaction, &nodeTable, std::move(columnIDs));
+}
+
+NodeTableScanState& OnDiskEmbeddingScanState::getLookupState(TableScanSource source,
+    common::node_group_idx_t nodeGroupIdx) {
+    const auto key = (static_cast<uint64_t>(nodeGroupIdx) << 2) | static_cast<uint64_t>(source);
+    auto& state = lookupStates[key];
+    if (!state) {
+        std::vector outVectors{&scanChunk.getValueVectorMutable(1)};
+        state = std::make_unique<NodeTableScanState>(&scanChunk.getValueVectorMutable(0),
+            outVectors, scanChunk.state);
+        state->setToTable(transaction, nodeTable, std::vector{columnID});
+        state->source = source;
+        state->nodeGroupIdx = nodeGroupIdx;
+        nodeTable->initScanState(transaction, *state);
+    }
+    return *state;
 }
 
 void* OnDiskEmbeddingScanState::getEmbeddingPtr(const EmbeddingHandle& handle) {
